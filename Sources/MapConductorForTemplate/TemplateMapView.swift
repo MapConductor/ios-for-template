@@ -64,28 +64,68 @@ public final class TemplateViewState: MapViewState<TemplateMapDesignType> {
 /// ```
 public struct TemplateMapView: View {
     @ObservedObject private var state: TemplateViewState
+    private let style: MapViewStyle?
+    private let onStyleDiagnostics: (([String]) -> Void)?
     private let content: MapViewContent
 
     @StateObject private var coordinator = TemplateMapCoordinator()
 
-    public init(state: TemplateViewState, @MapViewContentBuilder content: () -> MapViewContent) {
+    public init(
+        state: TemplateViewState,
+        /// 実装点。**全プロバイダが同じ名前で受けること。** 何が起きるかは
+        /// このバックエンドが宣言した能力で決まる: ``VectorStyleSupportKey``
+        /// も ``VectorStyleMutationSupportKey`` も宣言していなければ、
+        /// スタイルはラスタータイルとして届く。
+        style: MapViewStyle? = nil,
+        onStyleDiagnostics: (([String]) -> Void)? = nil,
+        @MapViewContentBuilder content: () -> MapViewContent
+    ) {
         self.state = state
+        self.style = style
+        self.onStyleDiagnostics = onStyleDiagnostics
         self.content = content()
     }
 
     public var body: some View {
         // 実際のドライバーはここが `UIViewRepresentable`。
-        Color.clear
-            .onAppear { coordinator.attach(state: state, content: content) }
-            .onDisappear { coordinator.detach() }
-            // 実際のドライバーでは UIViewRepresentable の updateUIView がここにあたる。
-            .onChange(of: content.markers.count) { _ in coordinator.update(content: content) }
+        ZStack {
+            // スタイルを追随させるためだけの空ビュー。実際のドライバーは
+            // `UIViewRepresentable` の `updateUIView` で
+            // `coordinator.applyStyle(...)` を呼べばよく、これは要らない。
+            MapViewStyleApplier(
+                host: coordinator.styleHost(for: state),
+                style: style,
+                onDiagnostics: onStyleDiagnostics
+            )
+            .frame(width: 0, height: 0)
+            Color.clear
+                .onAppear { coordinator.attach(state: state, content: content) }
+                .onDisappear { coordinator.detach() }
+                // 実際のドライバーでは UIViewRepresentable の updateUIView がここにあたる。
+                .onChange(of: content.markers.count) { _ in coordinator.update(content: content) }
+        }
     }
 }
 
 /// 地図の寿命を持つ。UIViewRepresentable の `Coordinator` にあたる。
 @MainActor
 final class TemplateMapCoordinator: ObservableObject {
+    /// 地図がスタイルへ差し出すもの。実装点 — `MapViewCoordinatorBase` を
+    /// 継承するドライバーは `styleHost` を継承で得るので、これは要らない。
+    ///
+    /// `attach` を待たずに作る: SwiftUI は空ビューの `updateUIView` を
+    /// `onAppear` より先に回すことがあり、そこで掴んだレジストリが空だと
+    /// スタイルは何も見つけられない。
+    private var hosts: [ObjectIdentifier: MapViewStyleHost] = [:]
+
+    func styleHost(for state: TemplateViewState) -> MapViewStyleHost {
+        let key = ObjectIdentifier(state)
+        if let existing = hosts[key] { return existing }
+        let host = MapViewStyleHost(serviceRegistry: state.serviceRegistry)
+        hosts[key] = host
+        return host
+    }
+
     private var map: TemplateMap?
     private var controller: TemplateMapViewController?
     private let overlayScope = MapOverlayScope()
