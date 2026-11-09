@@ -1,6 +1,7 @@
+import Combine
 import CoreGraphics
 import Foundation
-import MapConductorCore
+@_spi(MapConductorDriver) import MapConductorCore
 
 // ============================================================================
 // D. レンダラ 6 種 × onAdd / onChange / onRemove / onPostProcess（実装点 25）
@@ -304,12 +305,62 @@ final class TemplateMarkerRenderer: MarkerOverlayRendererProtocol {
 final class TemplateMarkerController: AbstractMarkerController<TemplateShape, TemplateMarkerRenderer> {
     private weak var map: TemplateMap?
 
+    /// 同じ一覧の再送を入口で見抜く門番。**消さないこと。**
+    private var syncIdentity = MarkerListIdentity()
+    /// いま地図に載せている state と、その購読。
+    private var statesById: [String: MarkerState] = [:]
+    private var subscriptions: [String: AnyCancellable] = [:]
+
     init(map: TemplateMap?) {
         self.map = map
         super.init(markerManager: MarkerManager<TemplateShape>(), renderer: TemplateMarkerRenderer(map: map))
     }
 
+    /// アプリが宣言したマーカーの一覧を地図へ流す。body の評価ごとに呼ばれる。
+    ///
+    /// SwiftUI はカメラが動くたびに body を評価し直し、そのたびに**全マーカー**がここへ来る。
+    /// 同じ一覧（同じ state のインスタンスが同じ順）なら ``MarkerListIdentity`` が入口で帰す。
+    /// これを外すと 14.4 万本でピンチが凍る（詳細は型のコメント）。
+    ///
+    /// 比べるのは参照だけで、`@Published` は読まない。位置などの in-place の変更は
+    /// 下の購読が届ける。同じ id の**新しい state** が来たら、古い state の購読を外して
+    /// 新しい state を購読し直す。
+    ///
+    /// - Returns: 一覧を処理したら true（テスト用）。
+    @discardableResult
+    func syncMarkers(_ markers: [Marker]) -> Bool {
+        guard syncIdentity.shouldProcess(markers) else { return false }
+
+        var next: [String: MarkerState] = [:]
+        for marker in markers { next[marker.id] = marker.state }
+        for (id, previous) in statesById where next[id] !== previous {
+            subscriptions.removeValue(forKey: id)?.cancel()
+        }
+        statesById = next
+        for state in next.values where subscriptions[state.id] == nil {
+            subscribe(state)
+        }
+
+        // 差分（追加・変更・削除）はコアの `add(data:)` が取る。
+        let states = markers.map(\.state)
+        Task { await self.add(data: states) }
+        return true
+    }
+
+    private func subscribe(_ state: MarkerState) {
+        subscriptions[state.id] = state.asFlow()
+            .dropFirst() // 購読した瞬間の値は要らない
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak state] _ in
+                guard let self, let state, self.statesById[state.id] === state else { return }
+                Task { await self.update(state: state) }
+            }
+    }
+
     func unbind() {
+        subscriptions.values.forEach { $0.cancel() }
+        subscriptions.removeAll()
+        statesById.removeAll()
         renderer.unbind()
         map = nil
         destroy()

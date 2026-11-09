@@ -1,6 +1,7 @@
 import Foundation
 import MapConductorCore
 import SwiftUI
+import UIKit
 
 // ============================================================================
 // G. State サブクラス（実装点 3）
@@ -87,7 +88,6 @@ public struct TemplateMapView: View {
     }
 
     public var body: some View {
-        // 実際のドライバーはここが `UIViewRepresentable`。
         ZStack {
             // スタイルを追随させるためだけの空ビュー。実際のドライバーは
             // `UIViewRepresentable` の `updateUIView` で
@@ -98,12 +98,45 @@ public struct TemplateMapView: View {
                 onDiagnostics: onStyleDiagnostics
             )
             .frame(width: 0, height: 0)
-            Color.clear
-                .onAppear { coordinator.attach(state: state, content: content) }
-                .onDisappear { coordinator.detach() }
-                // 実際のドライバーでは UIViewRepresentable の updateUIView がここにあたる。
-                .onChange(of: content.markers.count) { _ in coordinator.update(content: content) }
+            TemplateMapSurface(state: state, content: content, coordinator: coordinator)
         }
+    }
+}
+
+/// 地図のビュー。実際のドライバーでは中身を SDK の `MapView` に置き換える。
+///
+/// **中身は `updateUIView` で毎回流すこと。**SwiftUI は body を評価するたびに
+/// `updateUIView` を呼ぶので、同じ id の新しい state への差し替え・数が同じままの
+/// 差し替え・マーカー以外だけの変更も、ここで漏れなくコレクタへ届く。
+/// 「何かが変わったときだけ流す」形（`onChange(of: content.markers.count)` など）に
+/// しないこと。数しか見ないと、上の 3 つを黙って取りこぼす。
+///
+/// 毎回流しても重くならないのは、差分を取る側が入口で帰すから。
+/// コレクタは state のインスタンスで比べ、マーカーは ``MarkerListIdentity`` が
+/// 同じ一覧の再送を弾く（カメラが動くたびに 14.4 万本を流しても 1ms 未満）。
+/// ここで `@Published` の値を読んで「変わったか」を自前で判定しないこと
+/// （全件ぶん読むと、それだけで body の評価ごとに重くなる）。
+private struct TemplateMapSurface: UIViewRepresentable {
+    let state: TemplateViewState
+    let content: MapViewContent
+    let coordinator: TemplateMapCoordinator
+
+    func makeCoordinator() -> TemplateMapCoordinator { coordinator }
+
+    func makeUIView(context: Context) -> UIView {
+        // 雛形の地図は描画面を持たない。実際のドライバーは SDK のビューを返す。
+        let view = UIView(frame: .zero)
+        view.backgroundColor = .clear
+        context.coordinator.attach(state: state, content: content)
+        return view
+    }
+
+    func updateUIView(_: UIView, context: Context) {
+        context.coordinator.update(content: content)
+    }
+
+    static func dismantleUIView(_: UIView, coordinator: TemplateMapCoordinator) {
+        coordinator.detach()
     }
 }
 
@@ -161,14 +194,15 @@ final class TemplateMapCoordinator: ObservableObject {
 
     /// アプリが宣言したオーバーレイをコレクタへ流す。**差分はコレクタが取る。**
     /// ここで自前の差分ループを書かないこと（移行前はそれが 1 プロバイダに 6 本あった）。
+    /// body の評価ごと（`updateUIView`）に呼ばれる。
     func update(content: MapViewContent) {
         overlayScope.circleCollector.sync(content.circles.map(\.state))
         overlayScope.polylineCollector.sync(content.polylines.map(\.state))
         overlayScope.polygonCollector.sync(content.polygons.map(\.state))
         overlayScope.groundImageCollector.sync(content.groundImages.map(\.state))
         overlayScope.rasterLayerCollector.sync(content.rasterLayers.map(\.state))
-        guard let controller else { return }
-        Task { await controller.markerController.add(data: content.markers.map(\.state)) }
+        // 同じ一覧の再送は門番が入口で帰す（body の評価ごとに呼ばれても軽い）。
+        controller?.markerController.syncMarkers(content.markers)
     }
 
     func detach() {
