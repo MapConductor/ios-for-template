@@ -67,8 +67,8 @@ public final class TemplateMapHost {
         overlayScope.polygonCollector.sync(content.polygons.map(\.state))
         overlayScope.groundImageCollector.sync(content.groundImages.map(\.state))
         overlayScope.rasterLayerCollector.sync(content.rasterLayers.map(\.state))
-        guard let controller else { return }
-        Task { await controller.markerController.add(data: content.markers.map(\.state)) }
+        // 同じ一覧の再送は門番が入口で帰す。
+        controller?.markerController.syncMarkers(content.markers)
     }
 
     public func unbind() {
